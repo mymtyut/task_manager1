@@ -1,4 +1,6 @@
 streamlit
 pandas
 openpyxl
+gspread
+oauth2client
 streamlit-mic-recorder
