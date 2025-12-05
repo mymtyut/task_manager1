@@ -5,31 +5,40 @@ import io
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formatdate
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 定数設定 ---
 PRIORITY_OPTIONS = ["高", "中", "低"]
 STATUS_OPTIONS = ["未対応", "進行中", "完了"]
-DATA_FILE = "tasks_data.xlsx"
+# Excelファイルの代わりにスプレッドシートの名前を指定
+# ※ステップ1で作ったスプレッドシートの名前と完全に一致させてください
+SPREADSHEET_NAME = "タスク管理DB"
 
-# --- データ操作関数 ---
+# --- データ操作関数 (Google Sheets版) ---
 
-@st.cache_data
+def get_gspread_client():
+    """Secretsから認証情報を取得してGoogle Sheetsに接続する"""
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    # StreamlitのSecretsから認証情報を読み込む
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    return client
+
+@st.cache_data(ttl=5)  # 5秒ごとにキャッシュをクリアして最新を取得
 def load_data():
-    """Excelファイルからデータをロードし、型を厳密に定義する"""
+    """スプレッドシートからデータをロードする"""
     try:
-        df = pd.read_excel(DATA_FILE)
-    except FileNotFoundError:
-        df = pd.DataFrame() 
-    
-    # --- 旧データからの移行処理 ---
-    if '担当者' in df.columns:
-        if '担当者1' not in df.columns:
-            df['担当者1'] = df['担当者']
-        else:
-            df['担当者1'] = df['担当者1'].fillna(df['担当者'])
-        df = df.drop(columns=['担当者'])
+        client = get_gspread_client()
+        sheet = client.open(SPREADSHEET_NAME).sheet1
+        data = sheet.get_all_records()
+        df = pd.DataFrame(data)
+    except Exception as e:
+        # シートが空、または見つからない場合は空のDFを作成
+        df = pd.DataFrame()
 
-    # 必要な列定義
+    # --- 列の定義と補完 ---
     required_cols = [
         "削除", "タイトル", "詳細", "依頼者", 
         "担当者1", "担当者2", "担当者3", 
@@ -40,24 +49,39 @@ def load_data():
         if col not in df.columns:
             df[col] = None if col != "削除" else False
 
-    # 重複列削除
-    df = df.loc[:, ~df.columns.duplicated()]
-    
-    # 削除フラグ
-    df['削除'] = df['削除'].fillna(False).astype(bool)
+    # 削除フラグの調整（スプレッドシートだと文字列"TRUE"/"FALSE"になりがちなので変換）
+    if '削除' in df.columns:
+        df['削除'] = df['削除'].astype(str).map({'TRUE': True, 'True': True, 'Tk': True, '1': True, '1.0': True}).fillna(False)
 
-    # テキスト入力欄の型変換
-    text_columns = ["タイトル", "詳細", "依頼者", "担当者1", "担当者2", "担当者3", "備考"]
+    # 文字列型の列をクリーンアップ
+    text_columns = ["タイトル", "詳細", "依頼者", "担当者1", "担当者2", "担当者3", "備考", "優先度", "進捗"]
     for col in text_columns:
-        df[col] = df[col].fillna("").astype(str)
-        df[col] = df[col].replace("nan", "")
+        df[col] = df[col].fillna("").astype(str).replace("nan", "")
 
     return df
 
 def save_data(df):
+    """データフレームの中身でスプレッドシートを全上書きする"""
     try:
-        # 保存時はExcelで見やすいように日付形式を保持するが、計算自体はPandasに任せる
-        df.to_excel(DATA_FILE, index=False, engine='openpyxl')
+        client = get_gspread_client()
+        sheet = client.open(SPREADSHEET_NAME).sheet1
+        
+        # 保存前に日付型を文字列に変換（JSONシリアライズ対策）
+        save_df = df.copy()
+        
+        # 日付列を文字列変換
+        for col in ['期限', '完了日']:
+            if col in save_df.columns:
+                # NaT（空の日付）を空文字に、それ以外をYYYY-MM-DDに
+                save_df[col] = save_df[col].apply(lambda x: x.strftime('%Y-%m-%d') if pd.notnull(x) else "")
+        
+        # 削除フラグも文字列に
+        save_df['削除'] = save_df['削除'].astype(str)
+
+        # 全データをクリアして書き込み
+        sheet.clear()
+        # ヘッダーとデータを書き込み
+        sheet.update([save_df.columns.values.tolist()] + save_df.values.tolist())
         return True
     except Exception as e:
         st.error(f"保存エラー: {e}")
@@ -84,13 +108,11 @@ def send_gmail(subject, body, to_email, from_email, app_password):
         st.error(f"メール送信エラー: {e}")
         return False
 
-# --- 日付型強制変換関数（修正版） ---
+# --- 日付型強制変換関数 ---
 def ensure_date_columns(df):
     target_cols = ['期限', '完了日']
     for col in target_cols:
         if col in df.columns:
-            # エラー回避のため、確実にPandasのTimestamp型（datetime64）に変換する
-            # .date() への変換は行わない（計算ができなくなるため）
             df[col] = pd.to_datetime(df[col], errors='coerce')
     return df
 
@@ -111,15 +133,12 @@ if 'edit_index' not in st.session_state:
 # リロード時の型安全対策
 st.session_state.tasks_df = ensure_date_columns(st.session_state.tasks_df)
 
-# --- 通知判定ロジック（修正版） ---
-# ここで datetime.date ではなく Timestamp を使うことで比較エラーを防ぐ
+# --- 通知判定ロジック ---
 today = pd.Timestamp.now().normalize()
-
 df_alert = st.session_state.tasks_df.copy()
 incomplete_mask = df_alert['進捗'] != '完了'
 
 # アラート対象抽出
-# df_alert['期限'] も today も同じ Timestamp型なのでエラーにならない
 alert_rows = df_alert[
     incomplete_mask & (
         (df_alert['期限'] < today) | 
@@ -131,7 +150,7 @@ alert_count = len(alert_rows)
 # --- ヘッダー & メール設定 ---
 col_title, col_alert = st.columns([1, 2])
 with col_title:
-    st.title("📝 社内タスク管理")
+    st.title("📝 社内タスク管理 (Cloud版)")
 with col_alert:
     if alert_count > 0:
         st.markdown(f"<h3 style='color: red;'>⚠️ 未完了・期限切れタスク: {alert_count}件</h3>", unsafe_allow_html=True)
@@ -148,7 +167,6 @@ with st.sidebar:
                 body = "【タスク管理アプリからの通知】\n\n以下のタスクが未完了、または期限切れです。\n\n"
                 for idx, row in alert_rows.iterrows():
                     assignees = f"{row.get('担当者1','') or ''} {row.get('担当者2','') or ''} {row.get('担当者3','') or ''}"
-                    # メール本文用に見やすく整形
                     deadline_str = row['期限'].strftime('%Y-%m-%d') if pd.notnull(row['期限']) else "未設定"
                     body += f"・タイトル: {row['タイトル']}\n"
                     body += f"  期限: {deadline_str} / 担当: {assignees}\n"
@@ -192,7 +210,6 @@ with st.expander(f"**タスク新規登録 / {'編集' if st.session_state.editi
         
         def get_default_date(key, days_offset=0):
             val = task_to_edit.get(key)
-            # Timestamp型の場合はdate型に変換してあげる（date_input用）
             if pd.notnull(val):
                 if isinstance(val, pd.Timestamp):
                     return val.date()
@@ -208,7 +225,6 @@ with st.expander(f"**タスク新規登録 / {'編集' if st.session_state.editi
         if not title:
             st.error("タイトルは必須です。")
         else:
-            # 保存時は Timestamp に変換しておく
             new_task = {
                 "削除": False, "タイトル": title, "詳細": details, "依頼者": requester, 
                 "担当者1": assignee1, "担当者2": assignee2, "担当者3": assignee3,
@@ -246,7 +262,6 @@ with st.expander("🔎 フィルター", expanded=False):
     f_c1, f_c2, f_c3 = st.columns(3)
     with f_c1: f_pri = st.multiselect("優先度", PRIORITY_OPTIONS)
     with f_c2:
-        # 担当者リスト作成 (空白除外)
         all_assignees = pd.unique(st.session_state.tasks_df[['担当者1', '担当者2', '担当者3']].astype(str).values.ravel('K'))
         all_assignees = [x for x in all_assignees if x != "" and x != "nan" and x != "None"]
         f_ass = st.multiselect("担当者 (いずれかに該当)", all_assignees)
